@@ -5,6 +5,9 @@ import { SourceText } from './analysis/project';
 import { closestTestFile } from './analysis/tests';
 import { compareBehaviors } from './compare';
 import { renderComparison } from './diffReport';
+import { DEFAULT_PLAN, checkPlan } from './plan/check';
+import { planSection } from './plan/plan';
+import { renderPlanCheck } from './plan/report';
 import { gitContext } from './git';
 import { Projects, fileKey } from './project';
 import { ReportContext, renderReport } from './report';
@@ -115,9 +118,65 @@ async function showBehaviors(uri: vscode.Uri, line: number): Promise<void> {
   await vscode.window.showTextDocument(report, { viewColumn: vscode.ViewColumn.Beside, preview: true, preserveFocus: true });
 }
 
-async function compareBehaviorsCommand(): Promise<void> {
+function workspaceFolder(): vscode.WorkspaceFolder | undefined {
   const active = vscode.window.activeTextEditor?.document.uri;
-  const folder = (active && vscode.workspace.getWorkspaceFolder(active)) ?? vscode.workspace.workspaceFolders?.[0];
+  return (active && vscode.workspace.getWorkspaceFolder(active)) ?? vscode.workspace.workspaceFolders?.[0];
+}
+
+/** Appends the function under the cursor, as it behaves now, to the plan, and opens the plan to edit. */
+async function addToPlanCommand(): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+  const folder = workspaceFolder();
+  if (!editor || !folder) {
+    vscode.window.showWarningMessage('Intent Tests: put the cursor inside a function first.');
+    return;
+  }
+  const doc = editor.document;
+  const offset = doc.offsetAt(editor.selection.active);
+  // The innermost function containing the cursor.
+  const fn = analysisFor(doc)
+    .filter((f) => f.node.getStart() <= offset && offset <= f.node.getEnd())
+    .sort((a, b) => a.node.getEnd() - a.node.getStart() - (b.node.getEnd() - b.node.getStart()))[0];
+  if (!fn) {
+    vscode.window.showWarningMessage('Intent Tests: no function at the cursor.');
+    return;
+  }
+  const planUri = vscode.Uri.joinPath(folder.uri, DEFAULT_PLAN);
+  let existing = '';
+  try {
+    existing = new TextDecoder().decode(await vscode.workspace.fs.readFile(planUri));
+  } catch {
+    existing = '# Plan\n\nDescribe what each function should do. Run "Intent Tests: Check Plan" to compare the code against it.\n';
+  }
+  const file = path.relative(folder.uri.fsPath, doc.fileName).split(path.sep).join('/');
+  const content = `${existing.trimEnd()}\n\n${planSection(fn, file)}`;
+  await vscode.workspace.fs.writeFile(planUri, new TextEncoder().encode(content));
+  const plan = await vscode.workspace.openTextDocument(planUri);
+  const shown = await vscode.window.showTextDocument(plan, { viewColumn: vscode.ViewColumn.Beside });
+  const end = new vscode.Position(plan.lineCount - 1, 0);
+  shown.revealRange(new vscode.Range(end, end));
+}
+
+async function checkPlanCommand(): Promise<void> {
+  const folder = workspaceFolder();
+  if (!folder) {
+    vscode.window.showWarningMessage('Intent Tests: open a folder first.');
+    return;
+  }
+  try {
+    const check = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Window, title: 'Intent Tests: checking the plan' },
+      () => checkPlan(folder.uri.fsPath, DEFAULT_PLAN, { overlay: unsavedDocuments(), projects }),
+    );
+    const report = await vscode.workspace.openTextDocument({ language: 'markdown', content: renderPlanCheck(check) });
+    await vscode.window.showTextDocument(report, { preview: true });
+  } catch (error) {
+    vscode.window.showErrorMessage(`Intent Tests: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function compareBehaviorsCommand(): Promise<void> {
+  const folder = workspaceFolder();
   if (!folder) {
     vscode.window.showWarningMessage('Intent Tests: open a folder inside a git repository first.');
     return;
@@ -170,6 +229,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.languages.registerCodeLensProvider(SELECTOR, lenses),
     vscode.commands.registerCommand('intentTests.showBehaviors', showBehaviors),
     vscode.commands.registerCommand('intentTests.compareBehaviors', compareBehaviorsCommand),
+    vscode.commands.registerCommand('intentTests.addToPlan', addToPlanCommand),
+    vscode.commands.registerCommand('intentTests.checkPlan', checkPlanCommand),
     vscode.workspace.onDidOpenTextDocument(refresh),
     vscode.workspace.onDidSaveTextDocument(refresh),
     vscode.workspace.onDidCloseTextDocument((doc) => {
