@@ -1,0 +1,58 @@
+{
+  "name": "intent-tests",
+  "displayName": "Intent Tests",
+  "description": "Finds the behaviors in your functions, checks them against what your code says it intends, and helps you test them.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Testing"
+  ],
+  "activationEvents": [
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact",
+    "onLanguage:javascript",
+    "onLanguage:javascriptreact"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "intentTests.showBehaviors",
+        "title": "Intent Tests: Show Behaviors"
+      }
+    ],
+    "configuration": {
+      "title": "Intent Tests",
+      "properties": {
+        "intentTests.mismatchWarnings": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a low-key note when an error message and the condition guarding it disagree (for example \"at least 18\" vs `age <= 18`)."
+        },
+        "intentTests.minBehaviors": {
+          "type": "number",
+          "default": 2,
+          "minimum": 1,
+          "description": "Only show the behavior count above functions with at least this many behaviors."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "typescript": "^5.6.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "@types/vscode": "1.90.0",
+    "vitest": "^2.1.8"
+  }
+}
