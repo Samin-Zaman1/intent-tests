@@ -84,6 +84,31 @@ export function toComparison(c: Condition): Comparison | undefined {
   return { subject: subject.getText().replace(/\s+/g, ' '), op: negated ? NEGATE[op] : op, value };
 }
 
+/** Any `<`/`<=`/`>`/`>=` comparison, negation applied: `!(a.length >= max)` → `{ left: 'a.length', op: '<', right: 'max' }`. */
+export function toRelation(c: Condition): { left: string; op: Op; right: string } | undefined {
+  if (!c.expr) return undefined;
+  let e = unwrap(c.expr);
+  let negated = c.negated;
+  while (ts.isPrefixUnaryExpression(e) && e.operator === ts.SyntaxKind.ExclamationToken) {
+    negated = !negated;
+    e = unwrap(e.operand);
+  }
+  if (!ts.isBinaryExpression(e)) return undefined;
+  const op = OPERATORS[e.operatorToken.kind];
+  if (!op) return undefined;
+  const text = (n: ts.Node) => n.getText().replace(/\s+/g, ' ');
+  return { left: text(e.left), op: negated ? NEGATE[op] : op, right: text(e.right) };
+}
+
+/** Same two operands, same direction, different strictness: the boundary value moved to the other side. */
+export function isBoundaryMove(before: Condition, after: Condition): boolean {
+  const a = toRelation(before);
+  const b = toRelation(after);
+  if (!a || !b || a.op === b.op) return false;
+  const bop = a.left === b.left && a.right === b.right ? b.op : a.left === b.right && a.right === b.left ? MIRROR[b.op] : undefined;
+  return !!bop && bop !== a.op && bop[0] === a.op[0];
+}
+
 function numberOf(expr: ts.Expression): number | undefined {
   const e = unwrap(expr);
   if (ts.isNumericLiteral(e)) return Number(e.text.replace(/_/g, ''));

@@ -7,7 +7,7 @@ export interface GitContext {
   recentCommits: string[];
 }
 
-function git(cwd: string, args: string[], { trim = true } = {}): Promise<string | undefined> {
+export function git(cwd: string, args: string[], { trim = true } = {}): Promise<string | undefined> {
   return new Promise((resolve) => {
     execFile(
       'git',
@@ -18,7 +18,7 @@ function git(cwd: string, args: string[], { trim = true } = {}): Promise<string 
   });
 }
 
-function lines(output: string | undefined): string[] {
+export function lines(output: string | undefined): string[] {
   return output ? output.split('\n').filter(Boolean) : [];
 }
 
@@ -53,6 +53,11 @@ export async function changedFiles(root: string, ref: string): Promise<string[]>
     git(root, ['ls-files', '--others', '--exclude-standard']),
   ]);
   return [...new Set([...lines(diff), ...lines(untracked)])];
+}
+
+/** Paths relative to the repo root that differ between two commits. */
+export async function changedFilesBetween(root: string, base: string, head: string): Promise<string[]> {
+  return lines(await git(root, ['diff', '--name-only', '--no-renames', base, head]));
 }
 
 /** Contents of a file at a commit, or undefined if it did not exist there. */

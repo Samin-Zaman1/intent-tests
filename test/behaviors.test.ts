@@ -48,7 +48,30 @@ describe('collectBehaviors', () => {
         function save(x: number) {
           if (x > 0) { store(x); } else { log('skipped'); }
         }`),
-    ).toEqual(['x > 0 => runs store(x)', "x <= 0 => runs log('skipped')"]);
+    ).toEqual(['x > 0 => runs store(x)', "x <= 0 => runs log('skipped')", 'always => completes without returning a value']);
+  });
+
+  it('ignores type declarations nested in callbacks (immer __tests__/produce.ts crashed this once)', () => {
+    const [fn] = analyze(`
+      function run() {
+        it(() => { type State = { readonly a: number }; const s: State = { a: 1 }; use(s as State); });
+        return 1;
+      }`);
+    expect(fn.behaviors[0].steps).toEqual(['it(() => { const s = { a: 1 }; use(s); })']);
+  });
+
+  it('records the statements run along each path, without comments or formatting', () => {
+    const [fn] = analyze(`
+      function total(items: Item[]) {
+        let sum = 0; // running total
+        for (const item of items) sum += item.price;
+        if (sum > 100) return sum * 0.9;
+        return sum;
+      }`);
+    expect(fn.behaviors.map((b) => b.steps)).toEqual([
+      ['let sum = 0', 'for (const item of items) sum += item.price'],
+      ['let sum = 0', 'for (const item of items) sum += item.price'],
+    ]);
   });
 
   it('treats an else that throws as a guard for the code after it', () => {
@@ -82,6 +105,15 @@ describe('findFunctions', () => {
       function outer() { function inner() {} return inner; }
     `).map((fn) => fn.name);
     expect(names).toEqual(['Cart.add', 'Cart.total', 'isAdult', 'outer']);
+  });
+
+  it('finds functions inside module-level expressions', () => {
+    const names = analyze(`
+      export default isSupported && function httpAdapter(config) { if (!config) throw new Error('x'); return send(config); };
+      app.get('/health', (req, res) => { res.send('ok'); });
+      export const handler = wrap(async () => 1);
+    `).map((fn) => fn.name);
+    expect(names).toEqual(['httpAdapter', 'app.get callback', 'wrap callback']);
   });
 
   it('captures parameter and return types', () => {

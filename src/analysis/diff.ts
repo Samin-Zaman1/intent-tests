@@ -1,6 +1,7 @@
-import { FunctionAnalysis } from './analyze';
+import * as ts from 'typescript';
+import { FileAnalysis, FunctionAnalysis } from './analyze';
 import { Behavior, Condition } from './behaviors';
-import { Mismatch, toComparison } from './mismatch';
+import { Mismatch, isBoundaryMove, toComparison, toRelation } from './mismatch';
 
 /** One condition that was rewritten, e.g. `age <= 18` → `age < 18`. */
 export interface ConditionEdit {
@@ -13,6 +14,8 @@ export interface ConditionEdit {
 export type BehaviorChange =
   | { kind: 'added'; after: Behavior }
   | { kind: 'removed'; before: Behavior }
+  /** Same conditions and same outcome text, but the statements run on the way there changed. */
+  | { kind: 'steps-changed'; before: Behavior; after: Behavior; removedSteps: string[]; addedSteps: string[] }
   | { kind: 'outcome-changed'; before: Behavior; after: Behavior }
   /** `edits` is set when the same number of conditions were rewritten in place. */
   | { kind: 'conditions-changed'; before: Behavior; after: Behavior; edits?: ConditionEdit[] };
@@ -39,10 +42,46 @@ export interface FunctionDiff {
   };
 }
 
+/** A module-level value that changed, and the functions in the same file that read it. */
+export interface ValueChange {
+  name: string;
+  before?: string;
+  after?: string;
+  usedBy: string[];
+  /** Exported values may also be read by other files. */
+  exported: boolean;
+}
+
 export interface FileBehaviorDiff {
   functions: FunctionDiff[];
-  /** Functions whose code changed while every behavior stayed the same, e.g. a refactor or added logging. */
+  /** Functions whose code changed while every behavior and step stayed the same: types, exports, or formatting. */
   editedWithoutBehaviorChange: string[];
+  valuesChanged: ValueChange[];
+}
+
+export function diffFiles(before: FileAnalysis, after: FileAnalysis): FileBehaviorDiff {
+  const diff = diffAnalyses(before.functions, after.functions);
+  const oldValues = new Map(before.values.map((v) => [v.name, v]));
+  const newValues = new Map(after.values.map((v) => [v.name, v]));
+  for (const name of new Set([...oldValues.keys(), ...newValues.keys()])) {
+    const old = oldValues.get(name);
+    const now = newValues.get(name);
+    if (old?.text === now?.text) continue;
+    const readers = (now ? after : before).functions.filter((fn) => readsIdentifier(fn.node, name)).map((fn) => fn.name);
+    diff.valuesChanged.push({ name, before: old?.text, after: now?.text, usedBy: readers, exported: !!(now ?? old)?.exported });
+  }
+  return diff;
+}
+
+function readsIdentifier(node: ts.Node, name: string): boolean {
+  let found = false;
+  const visit = (n: ts.Node): void => {
+    if (found) return;
+    if (ts.isIdentifier(n) && n.text === name && !(ts.isPropertyAccessExpression(n.parent) && n.parent.name === n)) found = true;
+    else ts.forEachChild(n, visit);
+  };
+  visit(node);
+  return found;
 }
 
 export function diffAnalyses(before: FunctionAnalysis[], after: FunctionAnalysis[]): FileBehaviorDiff {
@@ -73,7 +112,7 @@ export function diffAnalyses(before: FunctionAnalysis[], after: FunctionAnalysis
     functions.push({ name: fn.name, status: 'removed', changes, unchanged: 0, newMismatches: [], before: fn });
   }
 
-  return { functions, editedWithoutBehaviorChange };
+  return { functions, editedWithoutBehaviorChange, valuesChanged: [] };
 }
 
 /** Functions keyed by name; repeated names in one file get `#1`, `#2` in order of appearance. */
@@ -89,11 +128,12 @@ function keyed(fns: FunctionAnalysis[]): Map<string, FunctionAnalysis> {
 }
 
 const conditionsOf = (b: Behavior) => b.conditions.map((c) => c.text).join(' && ');
-const keyOf = (b: Behavior) => `${conditionsOf(b)} => ${b.outcome}`;
+const keyOf = (b: Behavior) => `${conditionsOf(b)} => ${b.outcome} | ${b.steps.join(' ; ')}`;
 
 /**
- * Matches behaviors in three passes: identical ones are unchanged; then same conditions with a new outcome;
- * then same outcome under related conditions. Whatever is left was added or removed.
+ * Matches behaviors in passes: identical ones (conditions, outcome and steps) are unchanged; then same conditions
+ * and outcome with different steps; then same conditions with a new outcome; then same outcome under related
+ * conditions. Whatever is left was added or removed.
  */
 export function diffBehaviors(before: Behavior[], after: Behavior[]): { changes: BehaviorChange[]; unchanged: number } {
   const oldLeft = [...before];
@@ -110,6 +150,10 @@ export function diffBehaviors(before: Behavior[], after: Behavior[]): { changes:
   }
 
   const changes: BehaviorChange[] = [];
+  const sameShape = (o: Behavior, n: Behavior) => (conditionsOf(o) === conditionsOf(n) && o.outcome === n.outcome ? 1 : undefined);
+  for (const [o, n] of pairUp(oldLeft, newLeft, sameShape)) {
+    changes.push({ kind: 'steps-changed', before: o, after: n, removedSteps: without(o.steps, n.steps), addedSteps: without(n.steps, o.steps) });
+  }
   for (const [o, n] of pairUp(oldLeft, newLeft, (o, n) => (conditionsOf(o) === conditionsOf(n) ? 1 : undefined))) {
     changes.push({ kind: 'outcome-changed', before: o, after: n });
   }
@@ -153,10 +197,14 @@ function relatedness(o: Behavior, n: Behavior): number | undefined {
   return score > 0 ? score : undefined;
 }
 
+/** Comparisons of the same subject against a number, or of the same two operands in either order. */
 function sameSubject(a: Condition, b: Condition): boolean {
   const ca = toComparison(a);
   const cb = toComparison(b);
-  return !!ca && !!cb && ca.subject === cb.subject;
+  if (ca && cb) return ca.subject === cb.subject;
+  const ra = toRelation(a);
+  const rb = toRelation(b);
+  return !!ra && !!rb && [ra.left, ra.right].sort().join('\0') === [rb.left, rb.right].sort().join('\0');
 }
 
 function conditionEdits(o: Behavior, n: Behavior): ConditionEdit[] | undefined {
@@ -165,12 +213,20 @@ function conditionEdits(o: Behavior, n: Behavior): ConditionEdit[] | undefined {
   o.conditions.forEach((oc, i) => {
     const nc = n.conditions[i];
     if (oc.text === nc.text) return;
-    const ca = toComparison(oc);
-    const cb = toComparison(nc);
-    const boundary = !!ca && !!cb && ca.subject === cb.subject && ca.value === cb.value && ca.op[0] === cb.op[0];
-    edits.push({ before: oc.text, after: nc.text, boundary });
+    edits.push({ before: oc.text, after: nc.text, boundary: isBoundaryMove(oc, nc) });
   });
   return edits;
+}
+
+/** Items of `a` not matched one-for-one in `b`. */
+function without(a: string[], b: string[]): string[] {
+  const rest = [...b];
+  return a.filter((item) => {
+    const i = rest.indexOf(item);
+    if (i < 0) return true;
+    rest.splice(i, 1);
+    return false;
+  });
 }
 
 function squash(text: string): string {

@@ -89,9 +89,12 @@ describe('findCallSites', () => {
 });
 
 describe('test files', () => {
-  it.each(['src/a.test.ts', 'src/a.spec.tsx', 'src/__tests__/a.ts', 'lib/a.test.mjs'])('%s is a test file', (f) =>
-    expect(isTestFile(f)).toBe(true),
+  it.each(['src/a.test.ts', 'src/a.spec.tsx', 'src/__tests__/a.ts', 'lib/a.test.mjs', 'src/addDays/test.ts', 'test/utils.ts', 'packages/x/tests/a.ts'])(
+    '%s is a test file',
+    (f) => expect(isTestFile(f)).toBe(true),
   );
+
+  it.each(['src/testing.ts', 'src/latest/a.ts', 'src/contest.ts'])('%s is not a test file', (f) => expect(isTestFile(f)).toBe(false));
 
   it('prefers a test for the same module, then the nearest folder', () => {
     const tests = ['/p/test/other.test.ts', '/p/src/user/__tests__/signup.test.ts', '/p/src/user/profile.test.ts'];

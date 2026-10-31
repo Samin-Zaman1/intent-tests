@@ -1,4 +1,5 @@
-const TEST_FILE = /\.(test|spec)\.[cm]?[jt]sx?$|[\\/]__tests__[\\/]/;
+/** `a.test.ts`, `a.spec.ts`, a file named `test.ts` (date-fns style), or anything under `__tests__/`, `test/`, `tests/`. */
+const TEST_FILE = /\.(test|spec)\.[cm]?[jt]sx?$|(^|[\\/])(test|spec)\.[cm]?[jt]sx?$|(^|[\\/])(__tests__|__mocks__|tests?|specs?)[\\/]/;
 
 export function isTestFile(fileName: string): boolean {
   return TEST_FILE.test(fileName);

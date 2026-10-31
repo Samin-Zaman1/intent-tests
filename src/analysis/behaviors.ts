@@ -15,6 +15,11 @@ export type OutcomeKind = 'return' | 'throw' | 'branch' | 'completes';
 export interface Behavior {
   kind: OutcomeKind;
   conditions: Condition[];
+  /**
+   * Statements run on the way to the outcome, printed without comments or formatting. Two behaviors with the same
+   * conditions and outcome text still differ if these differ, e.g. `const tolerance = 4 * EPSILON` before `return`.
+   */
+  steps: string[];
   outcome: string;
   /** Message of a thrown error, when it is a literal. */
   throwMessage?: string;
@@ -36,9 +41,53 @@ export interface FunctionInfo {
   behaviors: Behavior[];
 }
 
+/** A module-level value such as `const ulid = /^[0-7].../`. Functions that read it change behavior when it changes. */
+export interface TopLevelValue {
+  name: string;
+  /** Printed without comments or formatting. */
+  text: string;
+  exported: boolean;
+}
+
+interface Path {
+  conditions: Condition[];
+  steps: string[];
+}
+
 interface Context {
   sf: ts.SourceFile;
   out: Behavior[];
+}
+
+const printer = ts.createPrinter({ removeComments: true });
+
+/** Removes type annotations, type arguments and `as`/`satisfies`/`!`: they do not change what the code does. */
+const stripTypes: ts.TransformerFactory<ts.Node> = (context) => {
+  const visit = (node: ts.Node): ts.Node | undefined => {
+    if (ts.isAsExpression(node) || ts.isSatisfiesExpression(node) || ts.isTypeAssertionExpression(node) || ts.isNonNullExpression(node)) {
+      return visit(node.expression);
+    }
+    if (ts.isTypeAliasDeclaration(node) || ts.isInterfaceDeclaration(node)) return undefined;
+    // `extends Base` is an expression with type arguments, but it is also code.
+    if ((ts.isTypeNode(node) && !ts.isExpressionWithTypeArguments(node)) || ts.isTypeParameterDeclaration(node)) return undefined;
+    return ts.visitEachChild(node, visit, context);
+  };
+  return (node) => visit(node) ?? node;
+};
+
+/** Source text with comments, formatting and types normalized away, for comparing code across versions. */
+export function canonical(sf: ts.SourceFile, node: ts.Node): string {
+  try {
+    const result = ts.transform(node, [stripTypes]);
+    try {
+      return clean(printer.printNode(ts.EmitHint.Unspecified, result.transformed[0], sf)).replace(/;$/, '');
+    } finally {
+      result.dispose();
+    }
+  } catch {
+    // A construct the type stripper cannot rebuild: compare the raw text rather than fail the whole file.
+    return snippet(sf, node);
+  }
 }
 
 export function parse(fileName: string, text: string): ts.SourceFile {
@@ -52,13 +101,18 @@ function scriptKindFor(fileName: string): ts.ScriptKind {
   return ts.ScriptKind.TS;
 }
 
-/** Top-level testable functions: declarations, methods, and functions assigned to variables or class properties. */
+/** Top-level testable functions: declarations, methods, functions assigned to variables or class properties, and default exports. */
 export function findFunctions(sf: ts.SourceFile): FunctionInfo[] {
   const found: FunctionInfo[] = [];
   const visit = (node: ts.Node, cls?: ts.ClassLikeDeclaration): void => {
     const className = cls && (cls.name?.text ?? 'AnonymousClass');
-    if (ts.isFunctionDeclaration(node) && node.name && node.body) {
-      found.push(describe(sf, node, node.name.text, node, node.name));
+    if (ts.isFunctionDeclaration(node) && node.body) {
+      // `export default function () {}` has no name.
+      found.push(describe(sf, node, node.name?.text ?? 'default', node, node.name ?? node));
+      return;
+    }
+    if (ts.isExportAssignment(node) && (ts.isArrowFunction(node.expression) || ts.isFunctionExpression(node.expression))) {
+      found.push(describe(sf, node.expression, 'default', node, node.expression));
       return;
     }
     if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
@@ -86,10 +140,44 @@ export function findFunctions(sf: ts.SourceFile): FunctionInfo[] {
       found.push(describe(sf, node.initializer, name, host, node.name));
       return;
     }
+    // Functions inside other expressions: `export default supported && function httpAdapter() {}`, `app.get('/', (req) => {})`.
+    if ((ts.isFunctionExpression(node) || ts.isArrowFunction(node)) && node.body) {
+      const name = expressionFunctionName(sf, node);
+      if (name) {
+        found.push(describe(sf, node, name, node, ts.isFunctionExpression(node) && node.name ? node.name : node));
+        return;
+      }
+    }
     ts.forEachChild(node, (child) => visit(child, cls));
   };
   visit(sf);
   return found;
+}
+
+/** Its own name, `default` inside an `export default` expression, or `<callee> callback` for an argument; else undefined. */
+function expressionFunctionName(sf: ts.SourceFile, fn: ts.FunctionExpression | ts.ArrowFunction): string | undefined {
+  if (ts.isFunctionExpression(fn) && fn.name) return fn.name.text;
+  for (let node: ts.Node = fn.parent; node && !ts.isSourceFile(node); node = node.parent) {
+    if (ts.isExportAssignment(node)) return 'default';
+    if (ts.isCallExpression(node) && node.arguments.includes(fn as ts.Expression)) return `${clean(node.expression.getText(sf))} callback`;
+    if (!ts.isParenthesizedExpression(node) && !ts.isBinaryExpression(node) && !ts.isConditionalExpression(node)) break;
+  }
+  return undefined;
+}
+
+/** Module-level `const`/`let`/`var` values that are not functions. */
+export function findTopLevelValues(sf: ts.SourceFile): TopLevelValue[] {
+  const values: TopLevelValue[] = [];
+  for (const statement of sf.statements) {
+    if (!ts.isVariableStatement(statement)) continue;
+    const exported = !!statement.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
+    for (const decl of statement.declarationList.declarations) {
+      const init = decl.initializer;
+      if (!ts.isIdentifier(decl.name) || !init || ts.isArrowFunction(init) || ts.isFunctionExpression(init)) continue;
+      values.push({ name: decl.name.text, text: canonical(sf, init), exported });
+    }
+  }
+  return values;
 }
 
 function describe(
@@ -111,24 +199,28 @@ function describe(
   };
 }
 
-/** Walks the function body and records every path to a return, a throw, or a branch that does work. */
+/** Walks the function body and records every path to a return, a throw, a branch that does work, or the end. */
 export function collectBehaviors(sf: ts.SourceFile, fn: ts.FunctionLikeDeclaration): Behavior[] {
   const ctx: Context = { sf, out: [] };
   const body = fn.body;
   if (!body) return ctx.out;
+  const start: Path = { conditions: [], steps: [] };
   if (!ts.isBlock(body)) {
-    addReturn(ctx, body, [], body);
+    addReturn(ctx, body, start, body);
     return ctx.out;
   }
-  const end = visitStatements(ctx, body.statements, []);
-  if (end !== null && (ctx.out.length === 0 || end.length > 0)) {
-    ctx.out.push({ kind: 'completes', conditions: end, outcome: 'completes without returning a value', line: lineOf(sf, body.getEnd()) });
+  const end = visitStatements(ctx, body.statements, start);
+  if (end !== null) {
+    ctx.out.push({ kind: 'completes', ...end, outcome: 'completes without returning a value', line: lineOf(sf, body.getEnd()) });
   }
   return ctx.out;
 }
 
-/** Returns the conditions that hold after the statements run, or null if every path exits the function. */
-function visitStatements(ctx: Context, statements: readonly ts.Statement[], path: Condition[]): Condition[] | null {
+const when = (path: Path, condition: Condition): Path => ({ conditions: [...path.conditions, condition], steps: path.steps });
+const then = (ctx: Context, path: Path, s: ts.Node): Path => ({ conditions: path.conditions, steps: [...path.steps, canonical(ctx.sf, s)] });
+
+/** Returns the path that holds after the statements run, or null if every path exits the function. */
+function visitStatements(ctx: Context, statements: readonly ts.Statement[], path: Path): Path | null {
   let current = path;
   for (const statement of statements) {
     const next = visitStatement(ctx, statement, current);
@@ -138,10 +230,11 @@ function visitStatements(ctx: Context, statements: readonly ts.Statement[], path
   return current;
 }
 
-function visitStatement(ctx: Context, s: ts.Statement, path: Condition[]): Condition[] | null {
+function visitStatement(ctx: Context, s: ts.Statement, path: Path): Path | null {
   const { sf } = ctx;
   if (ts.isBlock(s)) return visitStatements(ctx, s.statements, path);
   if (ts.isLabeledStatement(s)) return visitStatement(ctx, s.statement, path);
+  if (ts.isEmptyStatement(s) || ts.isTypeAliasDeclaration(s) || ts.isInterfaceDeclaration(s)) return path;
 
   if (ts.isReturnStatement(s)) {
     addReturn(ctx, s.expression, path, s);
@@ -152,17 +245,18 @@ function visitStatement(ctx: Context, s: ts.Statement, path: Condition[]): Condi
     return null;
   }
 
+  // Where branches rejoin, the whole statement becomes a step: what runs after it may depend on what ran inside it.
   if (ts.isIfStatement(s)) {
-    const thenEnd = visitStatement(ctx, s.thenStatement, [...path, condition(sf, s.expression, false)]);
+    const thenEnd = visitStatement(ctx, s.thenStatement, when(path, condition(sf, s.expression, false)));
     if (thenEnd !== null) addBranch(ctx, thenEnd, s.thenStatement);
-    let elseEnd: Condition[] | null = [...path, condition(sf, s.expression, true)];
+    let elseEnd: Path | null = when(path, condition(sf, s.expression, true));
     if (s.elseStatement) {
       elseEnd = visitStatement(ctx, s.elseStatement, elseEnd);
       if (elseEnd !== null && !ts.isIfStatement(s.elseStatement)) addBranch(ctx, elseEnd, s.elseStatement);
     }
     if (thenEnd === null) return elseEnd;
     if (elseEnd === null) return thenEnd;
-    return path;
+    return then(ctx, path, s);
   }
 
   if (ts.isSwitchStatement(s)) {
@@ -175,23 +269,23 @@ function visitStatement(ctx: Context, s: ts.Statement, path: Condition[]): Condi
       labels.push(ts.isCaseClause(clause) ? `${subject} === ${clean(clause.expression.getText(sf))}` : `${subject} matches no case`);
       // Empty clauses fall through, so their labels join the next clause's condition.
       if (clause.statements.length === 0) continue;
-      const end = visitStatements(ctx, clause.statements, [...path, { text: labels.join(' || '), negated: false }]);
+      const end = visitStatements(ctx, clause.statements, when(path, { text: labels.join(' || '), negated: false }));
       labels = [];
       if (end !== null) {
         allExit = false;
         addBranch(ctx, end, clause.statements);
       }
     }
-    return allExit && hasDefault ? null : path;
+    return allExit && hasDefault ? null : then(ctx, path, s);
   }
 
   if (ts.isTryStatement(s)) {
     const tryEnd = visitStatements(ctx, s.tryBlock.statements, path);
     const catchEnd = s.catchClause
-      ? visitStatements(ctx, s.catchClause.block.statements, [...path, { text: 'an error is thrown in the try block', negated: false }])
+      ? visitStatements(ctx, s.catchClause.block.statements, when(path, { text: 'an error is thrown in the try block', negated: false }))
       : null;
     if (s.finallyBlock) visitStatements(ctx, s.finallyBlock.statements, path);
-    return tryEnd === null && catchEnd === null ? null : path;
+    return tryEnd === null && catchEnd === null ? null : then(ctx, path, s);
   }
 
   if (
@@ -201,29 +295,29 @@ function visitStatement(ctx: Context, s: ts.Statement, path: Condition[]): Condi
     ts.isWhileStatement(s) ||
     ts.isDoStatement(s)
   ) {
-    visitStatement(ctx, s.statement, [...path, { text: `inside loop: ${loopHeader(sf, s)}`, negated: false }]);
-    return path;
+    visitStatement(ctx, s.statement, when(path, { text: `inside loop: ${loopHeader(sf, s)}`, negated: false }));
+    return then(ctx, path, s);
   }
 
-  return path;
+  return then(ctx, path, s);
 }
 
-function addReturn(ctx: Context, expr: ts.Expression | undefined, path: Condition[], at: ts.Node): void {
+function addReturn(ctx: Context, expr: ts.Expression | undefined, path: Path, at: ts.Node): void {
   const e = expr && unwrap(expr);
   if (e && ts.isConditionalExpression(e)) {
-    addReturn(ctx, e.whenTrue, [...path, condition(ctx.sf, e.condition, false)], at);
-    addReturn(ctx, e.whenFalse, [...path, condition(ctx.sf, e.condition, true)], at);
+    addReturn(ctx, e.whenTrue, when(path, condition(ctx.sf, e.condition, false)), at);
+    addReturn(ctx, e.whenFalse, when(path, condition(ctx.sf, e.condition, true)), at);
     return;
   }
   ctx.out.push({
     kind: 'return',
-    conditions: path,
+    ...path,
     outcome: e ? `returns ${snippet(ctx.sf, e)}` : 'returns undefined',
     line: lineOf(ctx.sf, at.getStart(ctx.sf)),
   });
 }
 
-function addThrow(ctx: Context, s: ts.ThrowStatement, path: Condition[]): void {
+function addThrow(ctx: Context, s: ts.ThrowStatement, path: Path): void {
   const { sf } = ctx;
   const e = unwrap(s.expression);
   let outcome = `throws ${snippet(sf, e)}`;
@@ -234,15 +328,15 @@ function addThrow(ctx: Context, s: ts.ThrowStatement, path: Condition[]): void {
     else if (arg && ts.isTemplateExpression(arg)) throwMessage = arg.getText(sf).slice(1, -1);
     outcome = `throws ${e.expression.getText(sf)}` + (throwMessage !== undefined ? `: "${throwMessage}"` : '');
   }
-  ctx.out.push({ kind: 'throw', conditions: path, outcome, throwMessage, line: lineOf(sf, s.getStart(sf)) });
+  ctx.out.push({ kind: 'throw', ...path, outcome, throwMessage, line: lineOf(sf, s.getStart(sf)) });
 }
 
 /** Records a branch that does work without exiting, unless it only nests further control flow. */
-function addBranch(ctx: Context, path: Condition[], body: ts.Statement | readonly ts.Statement[]): void {
+function addBranch(ctx: Context, path: Path, body: ts.Statement | readonly ts.Statement[]): void {
   const statements = Array.isArray(body) ? body : ts.isBlock(body as ts.Statement) ? (body as ts.Block).statements : [body as ts.Statement];
   const work = statements.find((s) => ts.isExpressionStatement(s) || ts.isVariableStatement(s));
   if (!work) return;
-  ctx.out.push({ kind: 'branch', conditions: path, outcome: `runs ${snippet(ctx.sf, work)}`, line: lineOf(ctx.sf, work.getStart(ctx.sf)) });
+  ctx.out.push({ kind: 'branch', ...path, outcome: `runs ${snippet(ctx.sf, work)}`, line: lineOf(ctx.sf, work.getStart(ctx.sf)) });
 }
 
 function loopHeader(sf: ts.SourceFile, s: ts.IterationStatement): string {
