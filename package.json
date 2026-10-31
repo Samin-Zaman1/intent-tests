@@ -18,11 +18,18 @@
     "onLanguage:javascriptreact"
   ],
   "main": "./out/extension.js",
+  "bin": {
+    "intent-tests": "./out/cli.js"
+  },
   "contributes": {
     "commands": [
       {
         "command": "intentTests.showBehaviors",
         "title": "Intent Tests: Show Behaviors"
+      },
+      {
+        "command": "intentTests.compareBehaviors",
+        "title": "Intent Tests: Compare Behaviors…"
       }
     ],
     "configuration": {

@@ -29,6 +29,8 @@ export interface FunctionInfo {
   host: ts.Node;
   /** 0-based line of the declaration. */
   line: number;
+  /** Offset of the name to look up references from (the class name for constructors). */
+  namePos: number;
   params: { name: string; type?: string }[];
   returnType?: string;
   behaviors: Behavior[];
@@ -53,22 +55,23 @@ function scriptKindFor(fileName: string): ts.ScriptKind {
 /** Top-level testable functions: declarations, methods, and functions assigned to variables or class properties. */
 export function findFunctions(sf: ts.SourceFile): FunctionInfo[] {
   const found: FunctionInfo[] = [];
-  const visit = (node: ts.Node, className?: string): void => {
+  const visit = (node: ts.Node, cls?: ts.ClassLikeDeclaration): void => {
+    const className = cls && (cls.name?.text ?? 'AnonymousClass');
     if (ts.isFunctionDeclaration(node) && node.name && node.body) {
-      found.push(describe(sf, node, node.name.text, node));
+      found.push(describe(sf, node, node.name.text, node, node.name));
       return;
     }
     if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
-      const name = node.name?.text ?? 'AnonymousClass';
-      node.members.forEach((member) => visit(member, name));
+      node.members.forEach((member) => visit(member, node));
       return;
     }
-    if (
-      (ts.isMethodDeclaration(node) || ts.isConstructorDeclaration(node) || ts.isGetAccessor(node) || ts.isSetAccessor(node)) &&
-      node.body
-    ) {
-      const member = ts.isConstructorDeclaration(node) ? 'constructor' : node.name.getText(sf);
-      found.push(describe(sf, node, className ? `${className}.${member}` : member, node));
+    if (ts.isConstructorDeclaration(node) && node.body) {
+      found.push(describe(sf, node, `${className ?? 'AnonymousClass'}.constructor`, node, cls?.name ?? node));
+      return;
+    }
+    if ((ts.isMethodDeclaration(node) || ts.isGetAccessor(node) || ts.isSetAccessor(node)) && node.body) {
+      const member = node.name.getText(sf);
+      found.push(describe(sf, node, className ? `${className}.${member}` : member, node, node.name));
       return;
     }
     if (
@@ -80,21 +83,28 @@ export function findFunctions(sf: ts.SourceFile): FunctionInfo[] {
       const statement = node.parent.parent;
       const host = ts.isVariableDeclaration(node) && ts.isVariableStatement(statement) ? statement : node;
       const name = ts.isPropertyDeclaration(node) && className ? `${className}.${node.name.text}` : node.name.text;
-      found.push(describe(sf, node.initializer, name, host));
+      found.push(describe(sf, node.initializer, name, host, node.name));
       return;
     }
-    ts.forEachChild(node, (child) => visit(child, className));
+    ts.forEachChild(node, (child) => visit(child, cls));
   };
   visit(sf);
   return found;
 }
 
-function describe(sf: ts.SourceFile, fn: ts.FunctionLikeDeclaration, name: string, host: ts.Node): FunctionInfo {
+function describe(
+  sf: ts.SourceFile,
+  fn: ts.FunctionLikeDeclaration,
+  name: string,
+  host: ts.Node,
+  nameNode: ts.Node,
+): FunctionInfo {
   return {
     name,
     node: fn,
     host,
     line: lineOf(sf, host.getStart(sf)),
+    namePos: nameNode.getStart(sf),
     params: fn.parameters.map((p) => ({ name: p.name.getText(sf), type: p.type?.getText(sf) })),
     returnType: fn.type?.getText(sf),
     behaviors: collectBehaviors(sf, fn),
@@ -282,7 +292,12 @@ function clean(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
 }
 
+/** Full source text on one line. Never shortened here, so behaviors that differ late in a long expression still compare unequal. */
 function snippet(sf: ts.SourceFile, node: ts.Node): string {
-  const text = clean(node.getText(sf)).replace(/;$/, '');
-  return text.length > 80 ? `${text.slice(0, 79)}…` : text;
+  return clean(node.getText(sf)).replace(/;$/, '');
+}
+
+/** Shortens text for display. */
+export function truncate(text: string, max = 80): string {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
