@@ -71,7 +71,11 @@ function renderFunction(fn: FunctionDiff): string[] {
     else if (!touched) lines.push(`**Tests:** ⚠ ${reach} (${files}), none updated in this change`, '');
     else lines.push(`**Tests:** ✓ ${reach}, updated in this change (${files})`, '');
   }
-  fn.changes.filter((c) => c.kind !== 'steps-changed').forEach((change) => lines.push(`- ${renderChange(change)}`));
+  const shared = sharedConditions(fn.changes);
+  if (shared.length >= 2) {
+    lines.push(`_All changes below happen when ${shared.map((c) => `\`${c}\``).join(' and ')}; those conditions are left out._`, '');
+  }
+  fn.changes.filter((c) => c.kind !== 'steps-changed').forEach((change) => lines.push(`- ${renderChange(change, shared.length)}`));
   lines.push(...renderStepChanges(fn.changes));
   fn.newMismatches.forEach((m) => lines.push(`- ⚠ **Possible mismatch** _(line ${m.line + 1})_: ${m.explanation}`));
   if (fn.unchanged) lines.push(`- _${plural(fn.unchanged, 'other behavior')} unchanged_`);
@@ -145,7 +149,20 @@ function renderValue(value: ValueChange): string[] {
   ];
 }
 
-function renderChange(change: BehaviorChange): string {
+/** Leading conditions shared by every behavior that changed, which would otherwise repeat on every line. */
+function sharedConditions(changes: BehaviorChange[]): string[] {
+  const lists = changes
+    .filter((c) => c.kind !== 'steps-changed')
+    .flatMap((c) => ('after' in c ? [c.after] : []).concat('before' in c ? [c.before] : []))
+    .map((b) => b.conditions.map((c) => c.text));
+  if (lists.length < 2) return [];
+  const shared: string[] = [];
+  for (let i = 0; lists.every((l) => i < l.length - 1 && l[i] === lists[0][i]); i++) shared.push(lists[0][i]);
+  return shared;
+}
+
+function renderChange(change: BehaviorChange, skip = 0): string {
+  const when = (b: Behavior) => describeWhen(b, skip);
   switch (change.kind) {
     case 'steps-changed':
       return renderStepChanges([change])[0];
@@ -189,8 +206,9 @@ export function focusOnDifference(before: string, after: string, max = 80): [str
   return [clip(before), clip(after)];
 }
 
-function when(b: Behavior): string {
-  return b.conditions.length ? `When ${b.conditions.map((c) => `\`${c.text}\``).join(' and ')}` : 'Always';
+function describeWhen(b: Behavior, skip = 0): string {
+  const conditions = b.conditions.slice(skip);
+  return conditions.length ? `When ${conditions.map((c) => `\`${c.text}\``).join(' and ')}` : 'Always';
 }
 
 function lower(text: string): string {

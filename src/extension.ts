@@ -56,7 +56,8 @@ class BehaviorLensProvider implements vscode.CodeLensProvider {
     const lenses: vscode.CodeLens[] = [];
     for (const fn of analysisFor(doc)) {
       const shown = savedByName.get(fn.name);
-      if (!shown || (shown.behaviors.length < minBehaviors && !shown.mismatches.length)) continue;
+      // Nested functions are part of their parent's label; a label on every callback would be noise.
+      if (!shown || fn.parent || (shown.behaviors.length < minBehaviors && !shown.mismatches.length)) continue;
       const title =
         `${shown.behaviors.length} behaviors` +
         (shown.mismatches.length ? ` · ⚠ ${shown.mismatches.length} possible mismatch` : '');

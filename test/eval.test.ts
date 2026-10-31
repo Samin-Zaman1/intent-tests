@@ -28,8 +28,9 @@ describe('commit selection', () => {
 });
 
 describe('identifier-only changes', () => {
-  it('keeps string contents and operators, replaces names', () => {
-    expect(shape(`user.age >= 18 => throws Error: "Too young"`)).toBe(`_._ >= 18 => throws _: "Too young"`);
+  it('keeps string contents and operators, replaces names (a property chain counts as one name)', () => {
+    expect(shape(`user.age >= 18 => throws Error: "Too young"`)).toBe(`_ >= 18 => throws _: "Too young"`);
+    expect(shape(`config?.socketPath && f(a.b, c)`)).toBe(`_ && _(_, _)`);
   });
 
   const change = (before: string, after: string) =>

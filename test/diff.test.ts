@@ -81,6 +81,19 @@ describe('diffAnalyses', () => {
     ).toEqual(['+ b => returns true', '+ !b => returns false', '- a => returns true', '- !a => returns false']);
   });
 
+  it('pairs behaviors that only renamed something instead of reporting them as removed and added', () => {
+    // axios 140a17944a: `config.socketPath` became a local `socketPath` throughout.
+    expect(
+      changesIn(
+        `function send(config: C) { if (config.socketPath && typeof config.socketPath !== 'string') return fail(config.socketPath); return go(); }`,
+        `function send(config: C) { const socketPath = own('socketPath'); if (socketPath && typeof socketPath !== 'string') return fail(socketPath); return go(); }`,
+      ),
+    ).toEqual([
+      "~ returns fail(socketPath): config.socketPath && typeof config.socketPath !== 'string' -> socketPath && typeof socketPath !== 'string'",
+      "~ returns go(): !(config.socketPath && typeof config.socketPath !== 'string') -> !(socketPath && typeof socketPath !== 'string')",
+    ]);
+  });
+
   it('reports added and removed functions', () => {
     const result = diff(`function a() { return 1; }`, `function b(x: boolean) { return x ? 1 : 2; }`);
     expect(result.functions.map((f) => [f.name, f.status, f.changes.length])).toEqual([

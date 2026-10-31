@@ -127,6 +127,25 @@ function keyed(fns: FunctionAnalysis[]): Map<string, FunctionAnalysis> {
   return map;
 }
 
+/** Words the behavior descriptions themselves use, plus keywords; everything else that looks like a name is an identifier. */
+const KEEP = new Set(
+  ('true false null undefined new typeof instanceof void this await yield delete in of ' +
+    'returns throws runs completes without returning a value inside loop an error is thrown the try block matches no case')
+    .split(' '),
+);
+
+/**
+ * Replaces names outside string literals with `_`, treating a property chain as one name, so `age > 18`,
+ * `years > 18` and `user.age > 18` all have the same shape.
+ */
+export function shape(text: string): string {
+  return text.replace(/(['"`])(?:\\.|(?!\1)[^\\])*\1|[A-Za-z_$][\w$]*(?:\??\.[A-Za-z_$][\w$]*)*/g, (token) =>
+    /^['"`]/.test(token) || KEEP.has(token) ? token : '_',
+  );
+}
+
+export const describeBehavior = (b: Behavior) => `${b.conditions.map((c) => c.text).join(' && ')} => ${b.outcome}`;
+
 const conditionsOf = (b: Behavior) => b.conditions.map((c) => c.text).join(' && ');
 const keyOf = (b: Behavior) => `${conditionsOf(b)} => ${b.outcome} | ${b.steps.join(' ; ')}`;
 
@@ -159,6 +178,14 @@ export function diffBehaviors(before: Behavior[], after: Behavior[]): { changes:
   }
   for (const [o, n] of pairUp(oldLeft, newLeft, (o, n) => (o.outcome === n.outcome ? relatedness(o, n) : undefined))) {
     changes.push({ kind: 'conditions-changed', before: o, after: n, edits: conditionEdits(o, n) });
+  }
+  // Same shape once names are ignored, e.g. `config.socketPath` → `socketPath` throughout: a rename, not a new behavior.
+  for (const [o, n] of pairUp(oldLeft, newLeft, (o, n) => (shape(describeBehavior(o)) === shape(describeBehavior(n)) ? 1 : undefined))) {
+    changes.push(
+      conditionsOf(o) === conditionsOf(n)
+        ? { kind: 'outcome-changed', before: o, after: n }
+        : { kind: 'conditions-changed', before: o, after: n, edits: conditionEdits(o, n) },
+    );
   }
   newLeft.forEach((n) => changes.push({ kind: 'added', after: n }));
   oldLeft.forEach((o) => changes.push({ kind: 'removed', before: o }));

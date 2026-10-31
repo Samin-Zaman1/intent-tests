@@ -52,12 +52,14 @@ describe('collectBehaviors', () => {
   });
 
   it('ignores type declarations nested in callbacks (immer __tests__/produce.ts crashed this once)', () => {
-    const [fn] = analyze(`
+    const [run, callback] = analyze(`
       function run() {
         it(() => { type State = { readonly a: number }; const s: State = { a: 1 }; use(s as State); });
         return 1;
       }`);
-    expect(fn.behaviors[0].steps).toEqual(['it(() => { const s = { a: 1 }; use(s); })']);
+    expect(run.behaviors[0].steps).toEqual(['it(() => { })']);
+    expect(callback.name).toBe('run › it callback');
+    expect(callback.behaviors[0].steps).toEqual(['const s = { a: 1 }', 'use(s)']);
   });
 
   it('records the statements run along each path, without comments or formatting', () => {
@@ -104,7 +106,29 @@ describe('findFunctions', () => {
       export const isAdult = (age: number): boolean => age >= 18;
       function outer() { function inner() {} return inner; }
     `).map((fn) => fn.name);
-    expect(names).toEqual(['Cart.add', 'Cart.total', 'isAdult', 'outer']);
+    expect(names).toEqual(['Cart.add', 'Cart.total', 'isAdult', 'outer', 'outer › inner']);
+  });
+
+  it('analyzes block-bodied nested functions on their own and keeps one-line callbacks inline', () => {
+    // vue ae4bd94b6e: the fix wrapped a nested callback's body in try/finally.
+    const fns = analyze(`
+      export function watch(source: Source, cb: Callback, once: boolean) {
+        if (once) {
+          const _cb = cb;
+          cb = (...args) => { try { return _cb(...args); } finally { stop(); } };
+        }
+        const sorted = source.items.sort((a, b) => a - b);
+        return wrap(async function run(resolve) { if (!sorted.length) return resolve(null); resolve(sorted); });
+      }`);
+    expect(fns.map((f) => [f.name, f.parent])).toEqual([
+      ['watch', undefined],
+      ['watch › cb', 'watch'],
+      ['watch › run', 'watch'],
+    ]);
+    const [watch, cb] = fns;
+    expect(watch.behaviors.map((b) => b.outcome)).toContain('returns wrap(async function run(resolve) { })');
+    expect(watch.behaviors.flatMap((b) => b.steps)).toContain('const sorted = source.items.sort((a, b) => a - b)');
+    expect(cb.behaviors.map((b) => b.outcome)).toEqual(['returns _cb(...args)']);
   });
 
   it('finds functions inside module-level expressions', () => {

@@ -1,5 +1,4 @@
-import { Behavior } from '../analysis/behaviors';
-import { BehaviorChange } from '../analysis/diff';
+import { BehaviorChange, describeBehavior, shape } from '../analysis/diff';
 import { isTestFile } from '../analysis/tests';
 
 /** Subjects of commits that likely fix a bug, including conventional-commit `fix(scope):` prefixes. */
@@ -27,25 +26,11 @@ export function smallFix(stats: FileStat[], maxLines = 60): { sourceFiles: numbe
   return { sourceFiles: source.length, linesChanged };
 }
 
-/** Words the behavior descriptions themselves use, plus keywords; everything else that looks like a name is an identifier. */
-const KEEP = new Set(
-  ('true false null undefined new typeof instanceof void this await yield delete in of ' +
-    'returns throws runs completes without returning a value inside loop an error is thrown the try block matches no case')
-    .split(' '),
-);
-
-/** Replaces identifiers outside string literals with `_`, so `age > 18` and `years > 18` have the same shape. */
-export function shape(text: string): string {
-  return text.replace(/(['"`])(?:\\.|(?!\1)[^\\])*\1|[A-Za-z_$][\w$]*/g, (token) =>
-    /^['"`]/.test(token) || KEEP.has(token) ? token : '_',
-  );
-}
-
-const describe = (b: Behavior) => `${b.conditions.map((c) => c.text).join(' && ')} => ${b.outcome}`;
+export { shape };
 
 /** A change whose before and after differ only in names: often a rename, sometimes a different variable checked. */
 export function isIdentifierOnly(change: BehaviorChange): boolean {
   if (change.kind === 'steps-changed') return shape(change.removedSteps.join(';')) === shape(change.addedSteps.join(';'));
   if (change.kind !== 'outcome-changed' && change.kind !== 'conditions-changed') return false;
-  return shape(describe(change.before)) === shape(describe(change.after));
+  return shape(describeBehavior(change.before)) === shape(describeBehavior(change.after));
 }

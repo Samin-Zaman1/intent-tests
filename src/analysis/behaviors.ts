@@ -39,6 +39,8 @@ export interface FunctionInfo {
   params: { name: string; type?: string }[];
   returnType?: string;
   behaviors: Behavior[];
+  /** Name of the enclosing function, for functions nested inside another one. */
+  parent?: string;
 }
 
 /** A module-level value such as `const ulid = /^[0-7].../`. Functions that read it change behavior when it changes. */
@@ -61,9 +63,13 @@ interface Context {
 
 const printer = ts.createPrinter({ removeComments: true });
 
-/** Removes type annotations, type arguments and `as`/`satisfies`/`!`: they do not change what the code does. */
-const stripTypes: ts.TransformerFactory<ts.Node> = (context) => {
+/**
+ * Removes type annotations, type arguments and `as`/`satisfies`/`!`, which do not change what the code does, and
+ * empties the bodies of nested functions, which are analyzed as functions of their own.
+ */
+const normalize: ts.TransformerFactory<ts.Node> = (context) => {
   const visit = (node: ts.Node): ts.Node | undefined => {
+    if (ts.isBlock(node) && node.parent && ts.isFunctionLike(node.parent)) return context.factory.createBlock([]);
     if (ts.isAsExpression(node) || ts.isSatisfiesExpression(node) || ts.isTypeAssertionExpression(node) || ts.isNonNullExpression(node)) {
       return visit(node.expression);
     }
@@ -75,10 +81,10 @@ const stripTypes: ts.TransformerFactory<ts.Node> = (context) => {
   return (node) => visit(node) ?? node;
 };
 
-/** Source text with comments, formatting and types normalized away, for comparing code across versions. */
+/** Source text with comments, formatting, types and nested function bodies normalized away, for comparing code across versions. */
 export function canonical(sf: ts.SourceFile, node: ts.Node): string {
   try {
-    const result = ts.transform(node, [stripTypes]);
+    const result = ts.transform(node, [normalize]);
     try {
       return clean(printer.printNode(ts.EmitHint.Unspecified, result.transformed[0], sf)).replace(/;$/, '');
     } finally {
@@ -101,18 +107,25 @@ function scriptKindFor(fileName: string): ts.ScriptKind {
   return ts.ScriptKind.TS;
 }
 
-/** Top-level testable functions: declarations, methods, functions assigned to variables or class properties, and default exports. */
+/**
+ * Testable functions: declarations, methods, functions assigned to variables or class properties, default exports,
+ * and (after each of those) the block-bodied functions nested inside it.
+ */
 export function findFunctions(sf: ts.SourceFile): FunctionInfo[] {
   const found: FunctionInfo[] = [];
+  const push = (fn: FunctionInfo): void => {
+    found.push(fn);
+    nestedFunctions(sf, fn).forEach(push);
+  };
   const visit = (node: ts.Node, cls?: ts.ClassLikeDeclaration): void => {
     const className = cls && (cls.name?.text ?? 'AnonymousClass');
     if (ts.isFunctionDeclaration(node) && node.body) {
       // `export default function () {}` has no name.
-      found.push(describe(sf, node, node.name?.text ?? 'default', node, node.name ?? node));
+      push(describe(sf, node, node.name?.text ?? 'default', node, node.name ?? node));
       return;
     }
     if (ts.isExportAssignment(node) && (ts.isArrowFunction(node.expression) || ts.isFunctionExpression(node.expression))) {
-      found.push(describe(sf, node.expression, 'default', node, node.expression));
+      push(describe(sf, node.expression, 'default', node, node.expression));
       return;
     }
     if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
@@ -120,12 +133,12 @@ export function findFunctions(sf: ts.SourceFile): FunctionInfo[] {
       return;
     }
     if (ts.isConstructorDeclaration(node) && node.body) {
-      found.push(describe(sf, node, `${className ?? 'AnonymousClass'}.constructor`, node, cls?.name ?? node));
+      push(describe(sf, node, `${className ?? 'AnonymousClass'}.constructor`, node, cls?.name ?? node));
       return;
     }
     if ((ts.isMethodDeclaration(node) || ts.isGetAccessor(node) || ts.isSetAccessor(node)) && node.body) {
       const member = node.name.getText(sf);
-      found.push(describe(sf, node, className ? `${className}.${member}` : member, node, node.name));
+      push(describe(sf, node, className ? `${className}.${member}` : member, node, node.name));
       return;
     }
     if (
@@ -137,14 +150,14 @@ export function findFunctions(sf: ts.SourceFile): FunctionInfo[] {
       const statement = node.parent.parent;
       const host = ts.isVariableDeclaration(node) && ts.isVariableStatement(statement) ? statement : node;
       const name = ts.isPropertyDeclaration(node) && className ? `${className}.${node.name.text}` : node.name.text;
-      found.push(describe(sf, node.initializer, name, host, node.name));
+      push(describe(sf, node.initializer, name, host, node.name));
       return;
     }
     // Functions inside other expressions: `export default supported && function httpAdapter() {}`, `app.get('/', (req) => {})`.
     if ((ts.isFunctionExpression(node) || ts.isArrowFunction(node)) && node.body) {
       const name = expressionFunctionName(sf, node);
       if (name) {
-        found.push(describe(sf, node, name, node, ts.isFunctionExpression(node) && node.name ? node.name : node));
+        push(describe(sf, node, name, node, ts.isFunctionExpression(node) && node.name ? node.name : node));
         return;
       }
     }
@@ -160,9 +173,40 @@ function expressionFunctionName(sf: ts.SourceFile, fn: ts.FunctionExpression | t
   for (let node: ts.Node = fn.parent; node && !ts.isSourceFile(node); node = node.parent) {
     if (ts.isExportAssignment(node)) return 'default';
     if (ts.isCallExpression(node) && node.arguments.includes(fn as ts.Expression)) return `${clean(node.expression.getText(sf))} callback`;
+    if (ts.isPropertyAssignment(node) && node.initializer === fn) return node.name.getText(sf);
     if (!ts.isParenthesizedExpression(node) && !ts.isBinaryExpression(node) && !ts.isConditionalExpression(node)) break;
   }
   return undefined;
+}
+
+/** Block-bodied functions directly inside `parent` (not inside those), each named `parent › child`. */
+function nestedFunctions(sf: ts.SourceFile, parent: FunctionInfo): FunctionInfo[] {
+  const nested: FunctionInfo[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isFunctionLike(node) && 'body' in node && node.body && ts.isBlock(node.body)) {
+      const fn = node as ts.FunctionLikeDeclaration;
+      const { name, nameNode } = nestedName(sf, fn);
+      nested.push(describe(sf, fn, `${parent.name} › ${name}`, fn, nameNode, parent.name));
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  if (parent.node.body) ts.forEachChild(parent.node.body, visit);
+  return nested;
+}
+
+function nestedName(sf: ts.SourceFile, fn: ts.FunctionLikeDeclaration): { name: string; nameNode: ts.Node } {
+  if (fn.name) return { name: fn.name.getText(sf), nameNode: fn.name };
+  let parent = fn.parent;
+  while (ts.isParenthesizedExpression(parent) || ts.isAwaitExpression(parent)) parent = parent.parent;
+  if (ts.isVariableDeclaration(parent) && ts.isIdentifier(parent.name)) return { name: parent.name.text, nameNode: parent.name };
+  if (ts.isPropertyAssignment(parent)) return { name: parent.name.getText(sf), nameNode: parent.name };
+  if (ts.isBinaryExpression(parent) && parent.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+    return { name: clean(parent.left.getText(sf)), nameNode: parent.left };
+  }
+  if (ts.isCallExpression(parent) || ts.isNewExpression(parent)) return { name: `${clean(parent.expression.getText(sf))} callback`, nameNode: fn };
+  if (ts.isReturnStatement(parent)) return { name: 'returned function', nameNode: fn };
+  return { name: 'anonymous function', nameNode: fn };
 }
 
 /** Module-level `const`/`let`/`var` values that are not functions. */
@@ -186,9 +230,11 @@ function describe(
   name: string,
   host: ts.Node,
   nameNode: ts.Node,
+  parent?: string,
 ): FunctionInfo {
   return {
     name,
+    parent,
     node: fn,
     host,
     line: lineOf(sf, host.getStart(sf)),
@@ -312,7 +358,7 @@ function addReturn(ctx: Context, expr: ts.Expression | undefined, path: Path, at
   ctx.out.push({
     kind: 'return',
     ...path,
-    outcome: e ? `returns ${snippet(ctx.sf, e)}` : 'returns undefined',
+    outcome: e ? `returns ${canonical(ctx.sf, e)}` : 'returns undefined',
     line: lineOf(ctx.sf, at.getStart(ctx.sf)),
   });
 }
@@ -336,7 +382,7 @@ function addBranch(ctx: Context, path: Path, body: ts.Statement | readonly ts.St
   const statements = Array.isArray(body) ? body : ts.isBlock(body as ts.Statement) ? (body as ts.Block).statements : [body as ts.Statement];
   const work = statements.find((s) => ts.isExpressionStatement(s) || ts.isVariableStatement(s));
   if (!work) return;
-  ctx.out.push({ kind: 'branch', ...path, outcome: `runs ${snippet(ctx.sf, work)}`, line: lineOf(ctx.sf, work.getStart(ctx.sf)) });
+  ctx.out.push({ kind: 'branch', ...path, outcome: `runs ${canonical(ctx.sf, work)}`, line: lineOf(ctx.sf, work.getStart(ctx.sf)) });
 }
 
 function loopHeader(sf: ts.SourceFile, s: ts.IterationStatement): string {
