@@ -3,3 +3,8 @@ out/
 *.vsix
 .eval-cache/
 eval-results/
+.worktrees/
+.claude/settings.local.json
+# Team Office runtime state (chat history, CI results, the sprint clock)
+team/chat/history/
+team/office.json

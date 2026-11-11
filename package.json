@@ -61,7 +61,8 @@
   "scripts": {
     "compile": "tsc -p .",
     "watch": "tsc -watch -p .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "team-chat": "node team/chat/server.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
